@@ -3,104 +3,102 @@ import numpy as np
 from pathlib import Path
 from matplotlib import pyplot as plt
 
-def harris_corners(
-    reference_image: str,
-    out_name: str = "harris.png",
-    block_size: int = 2,
-    ksize: int = 3,
-    k: float = 0.04,
-    threshold_rel: float = 0.1
-):
-
+def harris_corner_detection(reference_image: str, out_name: str = "harris.png"):
+    # --- Read and convert ---
     img = cv2.imread(reference_image)
     if img is None:
         raise FileNotFoundError(f"Could not read image '{reference_image}'")
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray32 = np.float32(gray)
+    gray = np.float32(gray)
 
     # --- Harris detection ---
-    dst = cv2.cornerHarris(gray32, block_size, ksize, k)
+    dst = cv2.cornerHarris(gray, blockSize=2, ksize=3, k=0.04)
     dst = cv2.dilate(dst, None)
 
-    # --- Thresholding ---
-    _, dst_thresh = cv2.threshold(dst, threshold_rel * dst.max(), 255, 0)
-    dst_thresh = np.uint8(dst_thresh)
-
-    # --- Find centroids ---
-    _, labels, stats, centroids = cv2.connectedComponentsWithStats(dst_thresh)
-
-    # --- Subpixel refinement ---
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001)
-    refined = cv2.cornerSubPix(gray32, np.float32(centroids), (5, 5), (-1, -1), criteria)
-
-    # --- Draw results ---
-    res = np.hstack((centroids, refined))
-    res = res.astype(int)
-
-    img[res[:, 1], res[:, 0]] = [0, 0, 255]   # Red = Harris corners
-    img[res[:, 3], res[:, 2]] = [0, 255, 0]   # Green = subpixel corners
+    # --- Threshold and mark corners ---
+    img[dst > 0.01 * dst.max()] = [0, 0, 255]   # red marks
 
     # --- Save result ---
     out_path = Path(out_name)
-    if out_path.suffix == "":
-        out_path = out_path.with_suffix(".png")
     cv2.imwrite(str(out_path), img)
-
     print(f"[INFO] Harris corners detected and saved to {out_path}")
     return str(out_path)
 
 
-MIN_MATCH_COUNT = 10
+def align_sift(image_to_align: str,
+               reference_image: str,
+               max_features: int = 10,
+               good_match_precent: float = 0.7,
+               aligned_out: str = "aligned.png",
+               matches_out: str = "matches.png"):
 
-img1 = cv2.imread('harris.png', cv2.IMREAD_GRAYSCALE)  # queryImage
-img2 = cv2.imread('align_this.jpg', cv2.IMREAD_GRAYSCALE)  # trainImage
 
-# Initiate SIFT detector
-sift = cv2.SIFT_create()
+    # --- Load images (color for drawing, gray for features) ---
+    im1_color = cv2.imread(image_to_align, cv2.IMREAD_COLOR)     # to be warped
+    im2_color = cv2.imread(reference_image, cv2.IMREAD_COLOR)    # reference frame
+    if im1_color is None:
+        raise FileNotFoundError(f"Could not read image_to_align: {image_to_align}")
+    if im2_color is None:
+        raise FileNotFoundError(f"Could not read reference_image: {reference_image}")
 
-# find the keypoints and descriptors with SIFT
-kp1, des1 = sift.detectAndCompute(img1, None)
-kp2, des2 = sift.detectAndCompute(img2, None)
+    im1_gray = cv2.cvtColor(im1_color, cv2.COLOR_BGR2GRAY)
+    im2_gray = cv2.cvtColor(im2_color, cv2.COLOR_BGR2GRAY)
 
-FLANN_INDEX_KDTREE = 1
-index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-search_params = dict(checks=50)
+    # --- SIFT keypoints & descriptors (cap features per instructions) ---
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(im1_gray, None)
+    kp2, des2 = sift.detectAndCompute(im2_gray, None)
+    if des1 is None or des2 is None or len(kp1) == 0 or len(kp2) == 0:
+        raise RuntimeError("SIFT found no features in one or both images.")
 
-flann = cv2.FlannBasedMatcher(index_params, search_params)
+    # --- FLANN matcher (KD-Tree) + Lowe's ratio test ---
+    index_params = dict(algorithm=1, trees=5)
+    search_params = dict(checks=50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+    knn = flann.knnMatch(des1, des2, k=2)
 
-matches = flann.knnMatch(des1, des2, k=2)
+    good = []
+    for m, n in knn:
+        if m.distance < good_match_precent * n.distance:
+            good.append(m)
+    if len(good) < 4:
+        raise RuntimeError(f"Not enough good matches ({len(good)}) to compute homography (need >= 4).")
 
-# store all the good matches as per Lowe's ratio test.
-good = []
-for m, n in matches:
-    if m.distance < 0.7 * n.distance:
-        good.append(m)
+    good = sorted(good, key = lambda x: x.distance)[:max_features]
+    # --- Homography (RANSAC) ---
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)  # from image_to_align
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)  # to reference_image
+    H, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=3.0)
+    if H is None:
+        raise RuntimeError("Homography estimation failed.")
 
-if len(good) > MIN_MATCH_COUNT:
-    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    # --- Warp image_to_align to reference frame size ---
+    h, w = im2_color.shape[:2]
+    aligned = cv2.warpPerspective(im1_color, H, (w, h))
 
-    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    matchesMask = mask.ravel().tolist()
+    # --- Draw matches (only inliers) and save outputs ---
+    inlier_mask = inlier_mask.ravel().astype(bool)
+    inlier_matches = [m for m, keep in zip(good, inlier_mask) if keep]
 
-    h, w = img1.shape
-    pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
-    dst = cv2.perspectiveTransform(pts, M)
+    match_vis = cv2.drawMatches(
+        im1_color, kp1, im2_color, kp2, inlier_matches, None,
+        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+    )
 
-    img2 = cv2.polylines(img2, [np.int32(dst)], True, 255, 3, cv2.LINE_AA)
+    cv2.imwrite(aligned_out, aligned)
+    cv2.imwrite(matches_out, match_vis)
 
-else:
-    print("Not enough matches are found - {}/{}".format(len(good), MIN_MATCH_COUNT))
-    matchesMask = None
+    return str(Path(aligned_out)), str(Path(matches_out))
 
-draw_params = dict(matchColor=(0, 255, 0),  # draw matches in green color
-                   singlePointColor=None,
-                   matchesMask=matchesMask,  # draw only inliers
-                   flags=2)
-
-img3 = cv2.drawMatches(img1, kp1, img2, kp2, good, None, **draw_params)
-
-plt.imshow(img3, 'gray'), plt.show()
 if __name__ == "__main__":
-    harris_corners("reference_img.png", "harris.png")
+    harris_corner_detection("reference_img.png", "harris.png")
+
+    align_sift(
+        image_to_align="align_this.jpg",
+        reference_image="reference_img.png",
+        max_features=10,
+        good_match_precent=0.7,
+        aligned_out="aligned.png",
+        matches_out="matches.png"
+    )
